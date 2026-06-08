@@ -52,39 +52,29 @@ send_alert() {
     echo "$body" | mail -s "[HEALTH ALERT] $subject" "$ALERT_EMAIL"
     log "INFO" "Email alert sent to $ALERT_EMAIL"
   else
-    echo -e "${RED}[ALERT]${NC} $subject" >&2
-    echo "$body" >&2
+    echo -e "${RED}[ALERT]${NC} $subject"
+    echo "$body"
   fi
 }
 
 # ── Get CPU usage (%) ──────────────────────────────────────────────────────────
 get_cpu_usage() {
-  # Read CPU idle from /proc/stat, compute usage over 1 second interval
-  local cpu_idle_1 cpu_idle_2 cpu_total_1 cpu_total_2
-  local cpu_line_1 cpu_line_2
-
-  cpu_line_1=$(grep '^cpu ' /proc/stat)
+  # Read two snapshots of /proc/stat 1 second apart, compute delta with awk
+  local snap1 snap2
+  snap1=$(grep '^cpu ' /proc/stat)
   sleep 1
-  cpu_line_2=$(grep '^cpu ' /proc/stat)
+  snap2=$(grep '^cpu ' /proc/stat)
 
-  # Fields: user nice system idle iowait irq softirq steal
-  read -r _ u1 n1 s1 id1 iow1 irq1 sirq1 steal1 <<< "$cpu_line_1"
-  read -r _ u2 n2 s2 id2 iow2 irq2 sirq2 steal2 <<< "$cpu_line_2"
-
-  cpu_total_1=$(( u1 + n1 + s1 + id1 + iow1 + irq1 + sirq1 + steal1 ))
-  cpu_total_2=$(( u2 + n2 + s2 + id2 + iow2 + irq2 + sirq2 + steal2 ))
-  cpu_idle_1=$id1
-  cpu_idle_2=$id2
-
-  local delta_total delta_idle
-  delta_total=$(( cpu_total_2 - cpu_total_1 ))
-  delta_idle=$(( cpu_idle_2 - cpu_idle_1 ))
-
-  if [[ $delta_total -eq 0 ]]; then
-    echo "0"
-  else
-    echo $(( (100 * (delta_total - delta_idle)) / delta_total ))
-  fi
+  printf '%s\n%s\n' "$snap1" "$snap2" | awk '
+    NR==1 { for(i=2;i<=NF;i++) t1+=$i; idle1=$5 }
+    NR==2 { for(i=2;i<=NF;i++) t2+=$i; idle2=$5 }
+    END {
+      dt = t2 - t1
+      di = idle2 - idle1
+      if (dt == 0) print 0
+      else printf "%d\n", (100 * (dt - di)) / dt
+    }
+  '
 }
 
 # ── Get RAM usage (%) ──────────────────────────────────────────────────────────
@@ -143,6 +133,7 @@ check_services() {
   fi
 
   for svc in "${services_to_check[@]}"; do
+    [[ -z "$svc" ]] && continue
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
       echo -e "  ${GREEN}✔${NC} $svc — running"
     else
@@ -171,7 +162,17 @@ generate_report() {
   local hostname
   hostname=$(hostname)
   local uptime_info
-  uptime_info=$(uptime -p 2>/dev/null || uptime)
+  if command -v uptime &>/dev/null; then
+    uptime_info=$(uptime -p 2>/dev/null || uptime)
+  else
+    # Fallback: read directly from /proc/uptime (always available on Linux)
+    local uptime_seconds
+    uptime_seconds=$(awk '{print int($1)}' /proc/uptime)
+    local days=$(( uptime_seconds / 86400 ))
+    local hours=$(( (uptime_seconds % 86400) / 3600 ))
+    local minutes=$(( (uptime_seconds % 3600) / 60 ))
+    uptime_info="up ${days}d ${hours}h ${minutes}m"
+  fi
 
   local cpu_usage ram_usage disk_usage
   echo -e "${BLUE}${BOLD}Collecting metrics... (this takes ~1 second for CPU)${NC}"
@@ -225,7 +226,7 @@ generate_report() {
     echo "RAM:  ${ram_usage}%  ($(get_ram_details))"
     echo "Disk: ${disk_usage}% ($(get_disk_details "${DISK_MOUNT:-/}"))"
     echo "Load: ${load_avg}"
-  } > "$REPORT_FILE"
+  } > "$REPORT_FILE" 2>/dev/null || true
 
   log "INFO" "Report generated: $REPORT_FILE"
 
